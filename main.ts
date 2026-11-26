@@ -1,38 +1,81 @@
-// news-image-20261125: ship the finished front page to the output directory.
-// Node 22, standard library only. No network, no randomness: the output
-// bytes are exactly the bytes of entry.png in this repository, so repeated
-// runs write identical files.
-import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+// Entry point for news-image-20261125.
+//
+// Copies the finished front page (entry.png, next to this file) into the
+// directory named by MAKEFUN_OUTPUT_DIR. Fully offline, standard library
+// only. Before copying it checks the file is really a PNG, is 1024x1024,
+// and is within the 1 MiB limit; after copying it re-reads the target and
+// confirms the bytes match the source exactly.
+
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
-const src = join(here, "entry.png");
+const PNG_MAGIC = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+]);
+const EXPECTED_WIDTH = 1024;
+const EXPECTED_HEIGHT = 1024;
+const MAX_BYTES = 1048576;
 
-// Refuse to ship a corrupt file: a PNG starts with its 8-byte signature,
-// and the gate caps an entry at 1 MiB (1048576 bytes).
-const data = readFileSync(src);
-const pngMagic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-if (!data.subarray(0, 8).equals(pngMagic)) {
-  throw new Error("entry.png is not a PNG file");
+const here = dirname(fileURLToPath(import.meta.url));
+const sourcePath = join(here, "entry.png");
+
+function fail(message: string): never {
+  throw new Error(message);
 }
-if (data.length > 1048576) {
-  throw new Error(`entry.png is ${data.length} bytes, over the 1 MiB gate limit`);
+
+function readPngSize(bytes: Buffer): { width: number; height: number } {
+  if (bytes.length < 33) {
+    fail("entry.png is too short to hold a PNG header");
+  }
+  if (!bytes.subarray(0, 8).equals(PNG_MAGIC)) {
+    fail("entry.png is not a PNG file");
+  }
+  const firstChunk = bytes.subarray(12, 16).toString("ascii");
+  if (firstChunk !== "IHDR") {
+    fail("entry.png does not start with an IHDR chunk");
+  }
+  return {
+    width: bytes.readUInt32BE(16),
+    height: bytes.readUInt32BE(20),
+  };
 }
-// The gate also caps the image at 1024 by 1024 pixels: read the IHDR
-// width and height (big-endian uint32 at offsets 16 and 20).
-const width = data.readUInt32BE(16);
-const height = data.readUInt32BE(20);
-if (width > 1024 || height > 1024) {
-  throw new Error(`entry.png is ${width}x${height}, over the 1024x1024 gate limit`);
+
+function main(): void {
+  const outDir = process.env.MAKEFUN_OUTPUT_DIR;
+  if (!outDir) {
+    fail("MAKEFUN_OUTPUT_DIR is not set");
+  }
+  const bytes = readFileSync(sourcePath);
+  if (bytes.length > MAX_BYTES) {
+    fail(`entry.png is ${bytes.length} bytes, over the 1 MiB limit`);
+  }
+  const { width, height } = readPngSize(bytes);
+  if (width !== EXPECTED_WIDTH || height !== EXPECTED_HEIGHT) {
+    fail(`entry.png is ${width}x${height}, expected 1024x1024`);
+  }
+  const sourceHash = createHash("sha256").update(bytes).digest("hex");
+  const outDirResolved = resolve(outDir);
+  mkdirSync(outDirResolved, { recursive: true });
+  const target = join(outDirResolved, "entry.png");
+  if (resolve(target) === resolve(sourcePath)) {
+    fail("MAKEFUN_OUTPUT_DIR points at the repository itself; refusing to overwrite the source");
+  }
+  writeFileSync(target, bytes);
+  const copied = readFileSync(target);
+  if (copied.length !== bytes.length) {
+    fail(
+      `copied entry.png is ${copied.length} bytes, expected ${bytes.length}`,
+    );
+  }
+  const copiedHash = createHash("sha256").update(copied).digest("hex");
+  if (copiedHash !== sourceHash) {
+    fail("copied entry.png does not match the source bytes");
+  }
+  console.log(
+    `copied entry.png (${copied.length} bytes, sha256=${sourceHash}) to ${target}`,
+  );
 }
-mkdirSync(outDir, { recursive: true });
-copyFileSync(src, join(outDir, "entry.png"));
-// Confirm the copy landed byte for byte: the grader runs the program
-// twice and the two outputs must be identical.
-const written = readFileSync(join(outDir, "entry.png"));
-if (!written.equals(data)) {
-  throw new Error("copied entry.png differs from the repository file");
-}
-console.log(`wrote entry.png (${data.length} bytes, ${width}x${height}) to ${outDir}`);
+
+main();
